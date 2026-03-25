@@ -1,23 +1,15 @@
 """
-Reproduction test for APIcast config-reload request stall – staging self-managed APIcast.
+Reproduction test for APIcast config-reload request stall – internal system APIcast.
 
-Root cause: when APIcast reloads a large configuration (boot mode,
-every cacheConfigurationSeconds), it rebuilds the policy chain for every
-service sequentially.  During that rebuild incoming requests are stalled.
-With 200+ products customers reported delays of 10-30 s.
+This variant uses the 3scale-embedded system APIcast (apicast-staging deployment)
+instead of deploying a standalone self-managed APIcast.  This is the closest
+reproduction of the customer's environment where the embedded APIcast is used.
 
-How to run (old version – should FAIL the latency assertion):
-    make testsuite/tests/apicast/parameters/config_reload_latency/test_config_reload_latency.py \\
-        NAMESPACE=<ns> flags="--disruptive -s"
+Services are created as HOSTED (not self_managed) so the system APIcast serves them.
+The system APIcast is temporarily set to boot mode with a 30-second config cache.
 
-How to run (fixed version – should PASS):
-    same command against a fixed build
-
-Debug / manual verification:
-    Add skip_cleanup: true to config/settings.local.yaml, run in debug mode
-    (-s), and pause after setup to inspect the environment manually.
-    The custom tenant and all products will survive the test run and can
-    be deleted by removing the tenant from the master admin portal.
+WARNING: Disruptive – modifies the shared system apicast-staging deployment.
+         Run in isolation.  See conftest.py for details.
 """
 
 import time
@@ -29,12 +21,7 @@ from testsuite.capabilities import Capability
 
 log = logging.getLogger(__name__)
 
-# How long to wait for the config cache to expire before measuring latency.
-# Must be slightly above cacheConfigurationSeconds (30) defined in conftest.
-CACHE_RELOAD_WAIT = 40  # seconds
-
-# Maximum acceptable latency for a single request during the reload window.
-# Buggy versions stall for 10-30 s; fixed versions should stay well under 3 s.
+CACHE_RELOAD_WAIT = 40  # seconds – must be > cacheConfigurationSeconds (30)
 MAX_ACCEPTABLE_LATENCY = 3.0  # seconds
 
 pytestmark = [
@@ -46,13 +33,14 @@ pytestmark = [
 
 
 @pytest.mark.usefixtures("many_services")
-def test_config_reload_latency(api_client):
+def test_config_reload_latency_system(api_client):
     """
     Preparation:
-        1. Create a dedicated custom tenant.
-        2. Deploy a self-managed APIcast in boot mode with a 30-second config cache.
-        3. Create 300+ products in that tenant so APIcast has a large config to reload.
-        4. Create one test product + application used to probe request latency.
+        1. Temporarily set the internal system apicast-staging to boot mode
+           with a 30-second config cache.
+        2. Create 300+ hosted products in the main tenant so the system APIcast
+           has a large configuration to reload.
+        3. Create one test product + application used to probe request latency.
 
     Test:
         - Send an initial request to confirm the setup is working.
@@ -61,18 +49,17 @@ def test_config_reload_latency(api_client):
         - Assert that no single request took longer than MAX_ACCEPTABLE_LATENCY.
 
     Expected result on FIXED build:  all assertions pass, max latency < 3 s.
-    Expected result on BUGGY build:  at least one request stalls for 10-30 s,
-                                     causing the latency assertion to fail.
+    Expected result on BUGGY build:  at least one request stalls for 10-30 s.
+
+    Teardown: system apicast-staging env vars are reverted to their original values.
     """
     client = api_client(disable_retry_status_list=[503, 404])
 
-
+    response = client.get("/get")
+    assert response.status_code == 200, "Pre-wait sanity check failed"
 
     log.info("Waiting %d s for the config cache to expire and trigger a reload …", CACHE_RELOAD_WAIT)
     time.sleep(CACHE_RELOAD_WAIT)
-
-    response = client.get("/get")
-    assert response.status_code == 200, "Pre-wait sanity check failed"
 
     latencies = []
     errors = []
@@ -110,7 +97,7 @@ def test_config_reload_latency(api_client):
         + ", ".join(f"{status} in {lat:.2f}s" for lat, status in errors)
     )
     assert max_latency < MAX_ACCEPTABLE_LATENCY, (
-        f"Max request latency during config reload was {max_latency:.2f} s "
+        f"Max request latency during system APIcast config reload was {max_latency:.2f} s "
         f"(threshold: {MAX_ACCEPTABLE_LATENCY} s). "
         "This indicates APIcast is blocking incoming requests while rebuilding "
         "the policy chain for all services."
